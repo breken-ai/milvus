@@ -21,6 +21,8 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/samber/lo"
@@ -674,6 +676,65 @@ func (s *QueryIteratorSuite) TestQueryIteratorWithVarCharPK() {
 	_, err = iter.Next(ctx)
 	s.Error(err)
 	s.ErrorIs(err, io.EOF)
+}
+
+func (s *QueryIteratorSuite) TestQueryIteratorWithVarCharPKNeedsEscape() {
+	ctx := context.Background()
+
+	schemaVarCharPK := entity.NewSchema().
+		WithField(entity.NewField().WithName("ID").WithDataType(entity.FieldTypeVarChar).WithIsPrimaryKey(true).WithMaxLength(64)).
+		WithField(entity.NewField().WithName("Vector").WithDataType(entity.FieldTypeFloatVector).WithDim(128))
+
+	cases := map[string]string{
+		"double_quote": `say "hi"`,
+		"backslash":    `C:\new\table`,
+	}
+
+	for name, lastPK := range cases {
+		s.Run(name, func() {
+			collectionName := fmt.Sprintf("coll_%s", s.randString(6))
+
+			s.mock.EXPECT().DescribeCollection(mock.Anything, mock.Anything).Return(&milvuspb.DescribeCollectionResponse{
+				CollectionID: 1,
+				Schema:       schemaVarCharPK.ProtoMessage(),
+			}, nil).Once()
+
+			s.mock.EXPECT().Query(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, qr *milvuspb.QueryRequest) (*milvuspb.QueryResults, error) {
+				return &milvuspb.QueryResults{
+					Status: merr.Success(),
+					FieldsData: []*schemapb.FieldData{
+						s.getVarcharFieldData("ID", []string{"A", lastPK}),
+					},
+				}, nil
+			}).Once()
+
+			iter, err := s.client.QueryIterator(ctx, NewQueryIteratorOption(collectionName).
+				WithOutputFields("ID").
+				WithBatchSize(2))
+			s.Require().NoError(err)
+
+			rs, err := iter.Next(ctx)
+			s.Require().NoError(err)
+			s.EqualValues(2, rs.ResultCount)
+
+			// the next page filter must compare against the exact last pk,
+			// so the string literal has to survive the server's unquoting
+			s.mock.EXPECT().Query(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, qr *milvuspb.QueryRequest) (*milvuspb.QueryResults, error) {
+				literal, found := strings.CutPrefix(qr.GetExpr(), "ID > ")
+				s.True(found, qr.GetExpr())
+				unquoted, err := strconv.Unquote(literal)
+				s.NoError(err, qr.GetExpr())
+				s.Equal(lastPK, unquoted)
+				return &milvuspb.QueryResults{
+					Status:     merr.Success(),
+					FieldsData: []*schemapb.FieldData{},
+				}, nil
+			}).Once()
+
+			_, err = iter.Next(ctx)
+			s.ErrorIs(err, io.EOF)
+		})
+	}
 }
 
 func (s *QueryIteratorSuite) TestQueryIteratorWithFilter() {

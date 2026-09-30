@@ -257,7 +257,9 @@ func (it *queryIterator) composeIteratorExpr() string {
 		}
 		return fmt.Sprintf("(%s) and %s", expr, pkFilter)
 	case entity.FieldTypeVarChar:
-		pkFilter := fmt.Sprintf(`%s > "%s"`, pkName, it.lastPK)
+		// quote the last pk so that `"` and `\` inside it survive the
+		// server-side string literal parsing
+		pkFilter := fmt.Sprintf(`%s > %s`, pkName, strconv.Quote(fmt.Sprint(it.lastPK)))
 		if len(expr) == 0 {
 			return pkFilter
 		}
